@@ -13,11 +13,23 @@ const app = new App({
 // Initialize Anthropic client
 const client = new Anthropic();
 
-// Google Docs setup
-const docs = google.docs({
-  version: 'v1',
-  auth: process.env.GOOGLE_API_KEY,
-});
+// Google Docs setup — authenticate with a service account.
+// The service account's JSON key is stored in the GOOGLE_SERVICE_ACCOUNT
+// environment variable (as a single-line JSON string), NOT committed to the repo.
+function getGoogleAuth() {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT;
+  if (!raw) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT env variable is not set');
+  }
+  const credentials = JSON.parse(raw);
+  return new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/documents.readonly'],
+  });
+}
+
+const auth = getGoogleAuth();
+const docs = google.docs({ version: 'v1', auth });
 
 // Function to fetch Google Doc content
 async function getGoogleDocContent(docId) {
@@ -85,9 +97,7 @@ ${trainingContent ? trainingContent.substring(0, 4000) : 'Document not available
 }
 
 // Core handler shared by both mentions and DMs.
-// `rawText` is the incoming message text; `isMention` tells us whether to strip a mention.
 async function handleIncomingMessage({ rawText, channel, say, slackClient, isMention }) {
-  // Strip the bot mention only when it's a channel mention; DMs have no mention.
   const question = isMention
     ? rawText.replace(/<@U[A-Z0-9]+>/g, '').trim()
     : (rawText || '').trim();
@@ -97,9 +107,8 @@ async function handleIncomingMessage({ rawText, channel, say, slackClient, isMen
     return;
   }
 
-  // Post a placeholder and capture ITS timestamp so we can edit it later.
   const placeholder = await say('🤔 Looking that up for you...');
-  const placeholderTs = placeholder.ts; // the bot's own message ts (not the user's)
+  const placeholderTs = placeholder.ts;
 
   const answer = await answerQuestion(question);
 
@@ -113,12 +122,11 @@ async function handleIncomingMessage({ rawText, channel, say, slackClient, isMen
     },
   ];
 
-  // Edit the placeholder we just posted, in the same channel/DM.
   await slackClient.chat.update({
     channel: channel,
     ts: placeholderTs,
     blocks: blocks,
-    text: answer, // fallback text
+    text: answer,
   });
 }
 
@@ -140,10 +148,6 @@ app.event('app_mention', async ({ event, say, client: slackClient }) => {
 
 // Handler for direct messages to the bot.
 app.message(async ({ message, say, client: slackClient }) => {
-  // Only handle real user DMs:
-  //  - channel_type 'im' means it's a direct message
-  //  - ignore messages from bots (including ourselves) to avoid loops
-  //  - ignore message edits/deletes/joins (subtype is set on those)
   if (message.channel_type !== 'im') return;
   if (message.subtype !== undefined) return;
   if (message.bot_id) return;
