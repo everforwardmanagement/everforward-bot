@@ -96,6 +96,33 @@ ${trainingContent ? trainingContent.substring(0, 4000) : 'Document not available
     : 'I could not find an answer to that question.';
 }
 
+// Convert standard markdown (what Claude returns) into Slack's mrkdwn syntax.
+function markdownToSlack(text) {
+  if (!text) return text;
+  let out = text;
+
+  // Markdown links [label](url) -> Slack <url|label>  (do this before other passes)
+  out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<$2|$1>');
+
+  // Headers (#, ##, ###...) at line start -> bold line
+  out = out.replace(/^\s*#{1,6}\s*(.+)$/gm, '*$1*');
+
+  // Bold: **text** or __text__ -> *text*
+  out = out.replace(/\*\*(.+?)\*\*/g, '*$1*');
+  out = out.replace(/__(.+?)__/g, '*$1*');
+
+  // Bullets: leading "- " or "* " -> "• "
+  out = out.replace(/^\s*[-*]\s+/gm, '• ');
+
+  // Horizontal rules (--- or ***) on their own line -> remove
+  out = out.replace(/^\s*([-*_])\1{2,}\s*$/gm, '');
+
+  // Collapse 3+ blank lines down to 2
+  out = out.replace(/\n{3,}/g, '\n\n');
+
+  return out.trim();
+}
+
 // Core handler shared by both mentions and DMs.
 async function handleIncomingMessage({ rawText, channel, say, slackClient, isMention }) {
   const question = isMention
@@ -110,7 +137,8 @@ async function handleIncomingMessage({ rawText, channel, say, slackClient, isMen
   const placeholder = await say('🤔 Looking that up for you...');
   const placeholderTs = placeholder.ts;
 
-  const answer = await answerQuestion(question);
+  const rawAnswer = await answerQuestion(question);
+  const answer = markdownToSlack(rawAnswer);
 
   const blocks = [
     {
