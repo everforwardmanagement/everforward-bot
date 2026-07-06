@@ -25,7 +25,7 @@ async function getGoogleDocContent(docId) {
     const response = await docs.documents.get({
       documentId: docId,
     });
-    
+
     // Extract text from the document
     let fullText = '';
     if (response.data.body && response.data.body.content) {
@@ -47,51 +47,12 @@ async function getGoogleDocContent(docId) {
   }
 }
 
-// Function to search the web using Claude's web search
-async function searchWeb(query) {
-  try {
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1000,
-      messages: [
-        {
-          role: 'user',
-          content: `Search the web for information about: ${query}\n\nProvide a brief, factual answer.`,
-        },
-      ],
-    });
-    return response.content[0].type === 'text' ? response.content[0].text : '';
-  } catch (error) {
-    console.error('Error with web search:', error);
-    return '';
-  }
-}
+// Shared logic: takes a raw question string, returns the answer text.
+async function answerQuestion(question) {
+  const docId = process.env.GOOGLE_DOC_ID;
+  const trainingContent = await getGoogleDocContent(docId);
 
-// Main message handler
-app.message(async ({ message, say, client: slackClient }) => {
-  // Only respond to app mentions
-  if (!message.text || !message.text.includes('<@U')) {
-    return;
-  }
-
-  try {
-    // Show that bot is processing
-    await say('🤔 Looking that up for you...');
-
-    // Extract the question (remove bot mention)
-    const question = message.text.replace(/<@U[A-Z0-9]+>/g, '').trim();
-
-    if (!question) {
-      await say('Please ask me a question! For example: "What are the commission rates?" or "How do I request time off?"');
-      return;
-    }
-
-    // Get training document content
-    const docId = process.env.GOOGLE_DOC_ID;
-    const trainingContent = await getGoogleDocContent(docId);
-
-    // Use Claude to answer from training doc first, then web if needed
-    const systemPrompt = `You are a helpful assistant for Everforward Management, a sales recruiting agency that partners with AT&T. 
+  const systemPrompt = `You are a helpful assistant for Everforward Management, a sales recruiting agency that partners with AT&T.
 
 You have access to an internal training document that contains company SOPs, policies, commission structures, training materials, and product knowledge.
 
@@ -106,40 +67,97 @@ Format your answers clearly:
 Training Document Content:
 ${trainingContent ? trainingContent.substring(0, 4000) : 'Document not available'}`;
 
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1500,
-      system: systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: `Question: ${question}`,
-        },
-      ],
-    });
-
-    const answer = response.content[0].type === 'text' ? response.content[0].text : 'I could not find an answer to that question.';
-
-    // Format the response nicely
-    const blocks = [
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1500,
+    system: systemPrompt,
+    messages: [
       {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*Question:* ${question}\n\n*Answer:*\n${answer}`,
-        },
+        role: 'user',
+        content: `Question: ${question}`,
       },
-    ];
+    ],
+  });
 
-    // Update the "looking that up" message with the answer
-    await slackClient.chat.update({
-      channel: message.channel,
-      ts: message.ts,
-      blocks: blocks,
-      text: answer, // Fallback for older Slack clients
+  return response.content[0].type === 'text'
+    ? response.content[0].text
+    : 'I could not find an answer to that question.';
+}
+
+// Core handler shared by both mentions and DMs.
+// `rawText` is the incoming message text; `isMention` tells us whether to strip a mention.
+async function handleIncomingMessage({ rawText, channel, say, slackClient, isMention }) {
+  // Strip the bot mention only when it's a channel mention; DMs have no mention.
+  const question = isMention
+    ? rawText.replace(/<@U[A-Z0-9]+>/g, '').trim()
+    : (rawText || '').trim();
+
+  if (!question) {
+    await say('Please ask me a question! For example: "What are the commission rates?" or "How do I request time off?"');
+    return;
+  }
+
+  // Post a placeholder and capture ITS timestamp so we can edit it later.
+  const placeholder = await say('🤔 Looking that up for you...');
+  const placeholderTs = placeholder.ts; // the bot's own message ts (not the user's)
+
+  const answer = await answerQuestion(question);
+
+  const blocks = [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*Question:* ${question}\n\n*Answer:*\n${answer}`,
+      },
+    },
+  ];
+
+  // Edit the placeholder we just posted, in the same channel/DM.
+  await slackClient.chat.update({
+    channel: channel,
+    ts: placeholderTs,
+    blocks: blocks,
+    text: answer, // fallback text
+  });
+}
+
+// Handler for @mentions in channels.
+app.event('app_mention', async ({ event, say, client: slackClient }) => {
+  try {
+    await handleIncomingMessage({
+      rawText: event.text,
+      channel: event.channel,
+      say,
+      slackClient,
+      isMention: true,
     });
   } catch (error) {
-    console.error('Error processing message:', error);
+    console.error('Error processing mention:', error);
+    await say('Sorry, I encountered an error. Please try again.');
+  }
+});
+
+// Handler for direct messages to the bot.
+app.message(async ({ message, say, client: slackClient }) => {
+  // Only handle real user DMs:
+  //  - channel_type 'im' means it's a direct message
+  //  - ignore messages from bots (including ourselves) to avoid loops
+  //  - ignore message edits/deletes/joins (subtype is set on those)
+  if (message.channel_type !== 'im') return;
+  if (message.subtype !== undefined) return;
+  if (message.bot_id) return;
+
+  try {
+    await handleIncomingMessage({
+      rawText: message.text,
+      channel: message.channel,
+      say,
+      slackClient,
+      isMention: false,
+    });
+  } catch (error) {
+    console.error('Error processing DM:', error);
     await say('Sorry, I encountered an error. Please try again.');
   }
 });
